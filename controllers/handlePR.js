@@ -1,11 +1,10 @@
 'use strict'
 
-const path = require('path')
-const config = require(path.join(__dirname, '/../config'))
-const GitHubApi = require('github')
+const config = require('../config')
+const GitHub = require('../lib/GitHub')
 const Staticman = require('../lib/Staticman')
 
-module.exports = (repo, data) => {
+module.exports = async (repo, data) => {
   const ua = config.get('analytics.uaTrackingId')
     ? require('universal-analytics')(config.get('analytics.uaTrackingId'))
     : null
@@ -14,57 +13,39 @@ module.exports = (repo, data) => {
     return
   }
 
-  const github = new GitHubApi({
-    debug: false,
-    protocol: 'https',
-    host: 'api.github.com',
-    pathPrefix: '',
-    headers: {
-      'user-agent': 'Staticman agent'
-    },
-    timeout: 5000,
-    Promise: Promise
-  })
-
-  github.authenticate({
-    type: 'oauth',
+  const github = await new GitHub({
+    username: data.repository.owner.login,
+    repository: data.repository.name,
     token: config.get('githubToken')
   })
 
-  return github.pullRequests.get({
-    user: data.repository.owner.login,
-    repo: data.repository.name,
-    number: data.number
-  }).then(response => {
-    if (response.head.ref.indexOf('staticman_')) {
+  return github.getReview(data.number).then(async (review) => {
+    if (review.sourceBranch.indexOf('staticman_')) {
       return null
     }
 
-    if (response.merged) {
-      const bodyMatch = response.body.match(/(?:.*?)<!--staticman_notification:(.+?)-->(?:.*?)/i)
+    if (review.state !== 'merged' && review.state !== 'closed') {
+      return null
+    }
+
+    if (review.state === 'merged') {
+      const bodyMatch = review.body.match(/(?:.*?)<!--staticman_notification:(.+?)-->(?:.*?)/i)
 
       if (bodyMatch && (bodyMatch.length === 2)) {
         try {
           const parsedBody = JSON.parse(bodyMatch[1])
-          const staticman = new Staticman(parsedBody.parameters)
+          const staticman = await new Staticman(parsedBody.parameters)
 
           staticman.setConfigPath(parsedBody.configPath)
-          staticman.processMerge(parsedBody.fields, parsedBody.options).catch(err => {
-            return Promise.reject(err)
-          })
+          staticman.processMerge(parsedBody.fields, parsedBody.options)
+            .catch(err => Promise.reject(err))
         } catch (err) {
           return Promise.reject(err)
         }
       }
     }
 
-    if (response.state === 'closed') {
-      return github.gitdata.deleteReference({
-        user: data.repository.owner.login,
-        repo: data.repository.name,
-        ref: 'heads/' + response.head.ref
-      })
-    }
+    return github.deleteBranch(review.sourceBranch)
   }).then(response => {
     if (ua) {
       ua.event('Hooks', 'Delete branch').send()
